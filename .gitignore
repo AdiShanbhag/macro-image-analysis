@@ -1,0 +1,10 @@
+.venv/
+data/raw/
+outputs/models/
+outputs/reports/
+outputs/eda/
+__pycache__/
+*.pyc
+*.joblib
+.DS_Store
+.idea/
