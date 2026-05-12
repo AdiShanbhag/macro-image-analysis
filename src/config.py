@@ -27,3 +27,11 @@ RANDOM_STATE = 42
 TEST_SIZE = 0.2
 N_ESTIMATORS = 200
 CLASS_WEIGHT = "balanced"
+
+# EDA settings
+
+# Number of sample images to include in the visual sample grid
+SAMPLE_GRID_COUNT: int = 9
+
+# Random seed used throughout the project for reproducibility
+RANDOM_SEED: int = 42

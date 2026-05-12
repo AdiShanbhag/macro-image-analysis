@@ -1,0 +1,10 @@
+Dataset Summary
+========================================
+  total_images              2665
+  total_classes             17
+  mean_width                599.27
+  mean_height               389.98
+  min_width                 274
+  max_width                 600
+  min_height                274
+  max_height                600
