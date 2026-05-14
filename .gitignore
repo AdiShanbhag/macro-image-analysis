@@ -4,3 +4,7 @@ __pycache__/
 *.joblib
 .DS_Store
 .idea/
+data/raw/
+outputs/models/
+outputs/reports/
+outputs/eda/
