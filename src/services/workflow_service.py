@@ -3,17 +3,16 @@ workflow_service.py
 
 Member 3 — Deployed Application.
 
-This module is the coordination layer for the deployed Tkinter application.
-It is intentionally self-contained: it ships its own minimal DatasetIndexer
-and ImagePreprocessor so the app can run end-to-end without depending on
-Member 1's or Member 2's source files. It only relies on their *artifacts*
-(saved model in outputs/models/, EDA charts in outputs/eda/) when those
-artifacts exist, and can regenerate either side if they do not.
+Coordination layer for the deployed Tkinter application. Self-contained:
+ships its own minimal DatasetIndexer and ImagePreprocessor so the app runs
+end-to-end without depending on Member 1's or Member 2's source files at
+import time. It only relies on their *artifacts* (saved model in
+outputs/models/, EDA charts in outputs/eda/) when those artifacts exist,
+and can regenerate either side if they do not.
 
-The preprocessing here matches the (128, 128) grayscale-and-flatten pipeline
-documented in src/config.py and used by Member 2's ImagePreprocessor, so a
-model trained anywhere in the team produces compatible inputs at predict
-time.
+The preprocessing pipeline matches the (128, 128) grayscale-and-flatten
+pipeline in src/config.py and Member 2's ImagePreprocessor, so a model
+trained anywhere in the team produces compatible inputs at predict time.
 
 Public class:
     WorkflowService — coordinates dataset summary, EDA generation, training,
@@ -30,8 +29,6 @@ import cv2
 import joblib
 import matplotlib
 
-# Use a non-interactive backend for chart generation so this works
-# whether or not a display is attached when EDA runs.
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
@@ -45,6 +42,7 @@ from src.config import (
     MODEL_OUTPUT_DIR,
     RANDOM_STATE,
     RAW_DATA_DIR,
+    REPORTS_OUTPUT_DIR,
     SUPPORTED_EXTENSIONS,
     TEST_SIZE,
 )
@@ -56,12 +54,7 @@ from src.config import (
 
 @dataclass
 class ImageRecord:
-    """Minimal record describing one indexed image on disk.
-
-    Kept simple on purpose — the deployed app only needs path, label, and
-    dimensions for summary / EDA. This mirrors the structure expected by
-    Member 1's richer model so anything we produce here is drop-in compatible.
-    """
+    """Minimal record describing one indexed image on disk."""
 
     file_path: str
     label: str
@@ -71,16 +64,7 @@ class ImageRecord:
 
 
 class _LocalDatasetIndexer:
-    """Self-contained dataset scanner used by the deployed app.
-
-    Walks the raw data directory recursively, treats each immediate parent
-    folder as the class label, and emits a tidy ``pandas.DataFrame``. Files
-    that cannot be opened by OpenCV are silently skipped so a few corrupt
-    samples never break the whole scan.
-
-    This is intentionally a duplicate of Member 1's DatasetIndexer interface
-    so the deployment never breaks if Member 1 has not yet pushed their work.
-    """
+    """Self-contained dataset scanner used by the deployed app."""
 
     def __init__(self, data_dir: Path = RAW_DATA_DIR) -> None:
         self.data_dir = Path(data_dir)
@@ -88,14 +72,9 @@ class _LocalDatasetIndexer:
     def build_dataframe(self) -> pd.DataFrame:
         """Return one row per indexed image with file path, label, and size.
 
-        Returns:
-            DataFrame with columns: file_path, label, width, height, channels.
-
         Raises:
-            FileNotFoundError: If the configured raw data directory is
-                missing — the user is told exactly where to put the dataset.
-            ValueError: If the directory exists but contains no supported
-                images.
+            FileNotFoundError: If the raw data directory is missing.
+            ValueError: If the directory exists but contains no supported images.
         """
         if not self.data_dir.exists():
             raise FileNotFoundError(
@@ -108,24 +87,18 @@ class _LocalDatasetIndexer:
         for file_path in self.data_dir.rglob("*"):
             if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 continue
-
             image = cv2.imread(str(file_path))
             if image is None:
-                # Unreadable file — skip rather than crash the whole scan.
                 continue
-
             height, width = image.shape[:2]
             channels = image.shape[2] if image.ndim == 3 else 1
-
-            records.append(
-                {
-                    "file_path": str(file_path),
-                    "label": file_path.parent.name,
-                    "width": int(width),
-                    "height": int(height),
-                    "channels": int(channels),
-                }
-            )
+            records.append({
+                "file_path": str(file_path),
+                "label": file_path.parent.name,
+                "width": int(width),
+                "height": int(height),
+                "channels": int(channels),
+            })
 
         if not records:
             raise ValueError(
@@ -137,64 +110,49 @@ class _LocalDatasetIndexer:
 
 
 class _LocalImagePreprocessor:
-    """Self-contained preprocessor mirroring the team's baseline pipeline.
-
-    Loads each image in grayscale, resizes to ``image_size``, normalises to
-    [0, 1] and flattens. Identical feature shape to Member 2's
-    ``ImagePreprocessor``, which is what keeps Member 2's saved model usable
-    here without any wrapper code.
-    """
+    """Self-contained preprocessor mirroring the team's baseline pipeline."""
 
     def __init__(self, image_size: tuple[int, int] = IMAGE_SIZE) -> None:
         self.image_size = image_size
 
     def transform(self, file_path: str | Path) -> np.ndarray:
-        """Load → grayscale → resize → normalise → flatten.
-
-        Args:
-            file_path: Path to an image file.
-
-        Returns:
-            1-D float32 numpy array of length ``image_size[0] * image_size[1]``.
+        """Load, grayscale, resize, normalise, and flatten one image.
 
         Raises:
             FileNotFoundError: If the path does not exist.
-            ValueError: If the file exists but OpenCV cannot decode it.
+            ValueError: If OpenCV cannot decode the file.
         """
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"Image file not found: {path}")
-
         image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise ValueError(
                 f"Could not read image (unsupported format or corrupt file): {path}"
             )
-
         resized = cv2.resize(image, self.image_size, interpolation=cv2.INTER_AREA)
         normalised = resized.astype("float32") / 255.0
         return normalised.flatten()
 
 
 # ---------------------------------------------------------------------------
-# WorkflowService — the single coordination layer the GUI talks to
+# WorkflowService
 # ---------------------------------------------------------------------------
 
 class WorkflowService:
     """Coordinate dataset, EDA, training, and prediction for the GUI.
 
-    The service is the only thing the Tkinter app talks to. That keeps the
-    UI thin and lets us swap the underlying implementation later — for
-    example, calling Member 2's ``ClassifierService`` directly — without
-    touching ``app.py``.
+    The GUI talks only to this class. All underlying logic is encapsulated
+    here so the UI stays thin and testable.
 
     Public surface:
+        - list_available_classes()
         - is_dataset_available()
         - is_model_available()
         - load_dataframe() / show_summary()
         - generate_eda()
         - list_eda_charts()
-        - train_model()
+        - train_model(selected_classes)
         - predict_image(file_path)
     """
 
@@ -203,27 +161,55 @@ class WorkflowService:
         data_dir: Path = RAW_DATA_DIR,
         eda_output_dir: Path = EDA_OUTPUT_DIR,
         model_output_dir: Path = MODEL_OUTPUT_DIR,
+        reports_output_dir: Path = REPORTS_OUTPUT_DIR,
         model_filename: str = MODEL_FILENAME,
         image_size: tuple[int, int] = IMAGE_SIZE,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.eda_output_dir = Path(eda_output_dir)
         self.model_output_dir = Path(model_output_dir)
+        self.reports_output_dir = Path(reports_output_dir)
         self.model_filename = model_filename
 
         self.eda_output_dir.mkdir(parents=True, exist_ok=True)
         self.model_output_dir.mkdir(parents=True, exist_ok=True)
+        self.reports_output_dir.mkdir(parents=True, exist_ok=True)
 
         self.indexer = _LocalDatasetIndexer(self.data_dir)
         self.preprocessor = _LocalImagePreprocessor(image_size)
 
         self._dataframe: Optional[pd.DataFrame] = None
-        self._model = None  # populated on first successful load / train
+        self._model = None
 
-    # ---------- Availability checks (used by the GUI to disable buttons) ----
+    # ---------- Class discovery ---------------------------------------------
+
+    def list_available_classes(self) -> list[str]:
+        """Return sorted list of class folder names found in data/raw/.
+
+        Only folders that contain at least one supported image are included.
+        Returns an empty list if the data directory does not exist.
+        """
+        if not self.data_dir.exists():
+            return []
+
+        classes = []
+        for folder in self.data_dir.iterdir():
+            if not folder.is_dir():
+                continue
+            has_image = any(
+                f.suffix.lower() in SUPPORTED_EXTENSIONS
+                for f in folder.iterdir()
+                if f.is_file()
+            )
+            if has_image:
+                classes.append(folder.name)
+
+        return sorted(classes)
+
+    # ---------- Availability checks -----------------------------------------
 
     def is_dataset_available(self) -> bool:
-        """True when the configured raw data folder has at least one image."""
+        """True when the raw data folder has at least one supported image."""
         if not self.data_dir.exists():
             return False
         for path in self.data_dir.rglob("*"):
@@ -233,28 +219,27 @@ class WorkflowService:
 
     @property
     def model_path(self) -> Path:
-        """Full path to the saved model artifact this service will load."""
+        """Full path to the saved model artifact."""
         return self.model_output_dir / self.model_filename
 
     def is_model_available(self) -> bool:
         """True when a saved model artifact exists on disk."""
         return self.model_path.exists()
 
-    # ---------- Dataset + summary --------------------------------------------
+    # ---------- Dataset + summary -------------------------------------------
 
     def load_dataframe(self, force_refresh: bool = False) -> pd.DataFrame:
-        """Index the dataset once and cache the resulting DataFrame.
+        """Index the dataset once and cache the result.
 
         Args:
-            force_refresh: When True, rebuild the index even if a cached copy
-                exists. Useful after the user adds new images to data/raw/.
+            force_refresh: Rebuild the index even if a cached copy exists.
         """
         if self._dataframe is None or force_refresh:
             self._dataframe = self.indexer.build_dataframe()
         return self._dataframe
 
     def show_summary(self) -> dict:
-        """Return key dataset statistics for display in the GUI status panel."""
+        """Return key dataset statistics for display in the GUI."""
         dataframe = self.load_dataframe()
         return {
             "total_images": int(len(dataframe)),
@@ -264,14 +249,12 @@ class WorkflowService:
             "images_per_class": dataframe["label"].value_counts().to_dict(),
         }
 
-    # ---------- EDA -----------------------------------------------------------
+    # ---------- EDA ---------------------------------------------------------
 
     def generate_eda(self) -> list[Path]:
-        """Produce the standard EDA chart set into ``outputs/eda/``.
+        """Produce the standard EDA chart set into outputs/eda/.
 
-        Generates a class distribution bar chart, a width/height histogram
-        pair, and a 3x3 sample grid. Returns the list of saved file paths so
-        the GUI can preview them straight away.
+        Returns the list of saved file paths so the GUI can preview them.
         """
         dataframe = self.load_dataframe()
         self.eda_output_dir.mkdir(parents=True, exist_ok=True)
@@ -283,18 +266,12 @@ class WorkflowService:
         return produced
 
     def list_eda_charts(self) -> list[Path]:
-        """Return every PNG chart currently sitting in ``outputs/eda/``.
-
-        The GUI uses this to populate its chart picker. Anything generated
-        by Member 1's EDAService also shows up here automatically because
-        we only look at the filesystem, not at who wrote the files.
-        """
+        """Return every PNG chart currently in outputs/eda/."""
         if not self.eda_output_dir.exists():
             return []
         return sorted(self.eda_output_dir.glob("*.png"))
 
     def _save_class_distribution(self, dataframe: pd.DataFrame) -> Path:
-        """Bar chart of image counts per class, sorted descending."""
         plt.figure(figsize=(12, 6))
         order = dataframe["label"].value_counts().index
         sns.countplot(data=dataframe, x="label", order=order)
@@ -307,7 +284,6 @@ class WorkflowService:
         return output_path
 
     def _save_image_size_distribution(self, dataframe: pd.DataFrame) -> Path:
-        """Side-by-side histograms of image width and height."""
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         sns.histplot(dataframe["width"], bins=20, ax=axes[0])
         sns.histplot(dataframe["height"], bins=20, ax=axes[1])
@@ -319,15 +295,11 @@ class WorkflowService:
         plt.close()
         return output_path
 
-    def _save_sample_grid(
-        self, dataframe: pd.DataFrame, sample_count: int = 9
-    ) -> Path:
-        """3x3 grid of randomly sampled images with their class labels."""
+    def _save_sample_grid(self, dataframe: pd.DataFrame, sample_count: int = 9) -> Path:
         sample_df = dataframe.sample(
             min(sample_count, len(dataframe)), random_state=RANDOM_STATE
         )
         fig, axes = plt.subplots(3, 3, figsize=(10, 10))
-
         for ax, (_, row) in zip(axes.flat, sample_df.iterrows()):
             image = cv2.imread(row["file_path"])
             if image is None:
@@ -337,32 +309,30 @@ class WorkflowService:
             ax.imshow(image)
             ax.set_title(row["label"], fontsize=9)
             ax.axis("off")
-
         for ax in axes.flat[len(sample_df):]:
             ax.axis("off")
-
         plt.tight_layout()
         output_path = self.eda_output_dir / "sample_grid.png"
         plt.savefig(output_path, dpi=120)
         plt.close()
         return output_path
 
-    # ---------- Training ------------------------------------------------------
+    # ---------- Training ----------------------------------------------------
 
-    def train_model(self) -> dict:
-        """Train a baseline Random Forest, persist it, and return metrics.
+    def train_model(self, selected_classes: list[str] | None = None) -> dict:
+        """Train a Random Forest on selected class folders and save artifacts.
 
-        Uses the self-contained preprocessor so the feature shape is
-        guaranteed to match what ``predict_image`` will produce later. Any
-        unreadable image is skipped rather than aborting the run.
+        Args:
+            selected_classes: List of class folder names to train on.
+                              If None or empty, trains on all available classes.
 
         Returns:
-            Dict containing ``accuracy``, ``report`` (str), ``confusion_matrix``
-            (np.ndarray), ``labels`` (list[str]), and ``model_path`` (str).
+            Dict with accuracy, report, confusion_matrix, labels, model_path,
+            skipped_images, training_samples, test_samples.
+
+        Raises:
+            ValueError: If no images can be processed for the selected classes.
         """
-        # Import lazily so the GUI can import this module without sklearn
-        # installed for users who only want to run prediction with a
-        # pre-shipped model.
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.metrics import (
             accuracy_score,
@@ -373,9 +343,22 @@ class WorkflowService:
 
         dataframe = self.load_dataframe()
 
+        # Filter to selected classes if specified
+        if selected_classes:
+            dataframe = dataframe[
+                dataframe["label"].isin(selected_classes)
+            ].reset_index(drop=True)
+
+            if dataframe.empty:
+                raise ValueError(
+                    "No images found for the selected classes. "
+                    "Check that the selected folders contain supported images."
+                )
+
         features: list[np.ndarray] = []
         labels: list[str] = []
         skipped = 0
+
         for _, row in dataframe.iterrows():
             try:
                 features.append(self.preprocessor.transform(row["file_path"]))
@@ -393,7 +376,10 @@ class WorkflowService:
         y = np.array(labels)
 
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+            X, y,
+            test_size=TEST_SIZE,
+            random_state=RANDOM_STATE,
+            stratify=y,
         )
 
         model = RandomForestClassifier(
@@ -407,17 +393,26 @@ class WorkflowService:
         predictions = model.predict(X_test)
         ordered_labels = sorted(np.unique(y).tolist())
 
-        # Persist model so subsequent app launches can predict immediately.
+        # Save model
         self.model_output_dir.mkdir(parents=True, exist_ok=True)
         joblib.dump(model, self.model_path)
         self._model = model
 
+        cm = confusion_matrix(y_test, predictions, labels=ordered_labels)
+
+        # Save confusion matrix as PNG for GUI display
+        self._save_confusion_matrix_plot(cm, ordered_labels)
+
+        # Save classification report as text
+        report_str = classification_report(y_test, predictions, zero_division=0)
+        self._save_classification_report(
+            accuracy_score(y_test, predictions), report_str
+        )
+
         return {
             "accuracy": float(accuracy_score(y_test, predictions)),
-            "report": classification_report(y_test, predictions, zero_division=0),
-            "confusion_matrix": confusion_matrix(
-                y_test, predictions, labels=ordered_labels
-            ),
+            "report": report_str,
+            "confusion_matrix": cm,
             "labels": ordered_labels,
             "model_path": str(self.model_path),
             "skipped_images": skipped,
@@ -425,15 +420,55 @@ class WorkflowService:
             "test_samples": int(len(X_test)),
         }
 
-    # ---------- Prediction ---------------------------------------------------
+    def _save_confusion_matrix_plot(
+        self, matrix: np.ndarray, labels: list[str]
+    ) -> Path:
+        """Save confusion matrix heatmap to outputs/reports/."""
+        self.reports_output_dir.mkdir(parents=True, exist_ok=True)
+
+        display_labels = [
+            label[:15] + "..." if len(label) > 15 else label
+            for label in labels
+        ]
+
+        fig_size = max(10, len(labels))
+        plt.figure(figsize=(fig_size, fig_size - 2))
+        sns.heatmap(
+            matrix,
+            annot=True,
+            fmt="d",
+            cmap="Blues",
+            xticklabels=display_labels,
+            yticklabels=display_labels,
+            linewidths=0.5,
+        )
+        plt.title("Confusion Matrix — Macroinvertebrate Classifier", fontsize=13, pad=15)
+        plt.xlabel("Predicted Class", fontsize=11)
+        plt.ylabel("Actual Class", fontsize=11)
+        plt.xticks(rotation=45, ha="right", fontsize=8)
+        plt.yticks(rotation=0, fontsize=8)
+        plt.tight_layout()
+
+        output_path = self.reports_output_dir / "confusion_matrix.png"
+        plt.savefig(output_path, dpi=150)
+        plt.close()
+        return output_path
+
+    def _save_classification_report(self, accuracy: float, report: str) -> Path:
+        """Save the classification report text to outputs/reports/."""
+        self.reports_output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = self.reports_output_dir / "classification_report.txt"
+        content = f"Model Accuracy: {accuracy:.4f}\n{'=' * 60}\n\n{report}"
+        report_path.write_text(content, encoding="utf-8")
+        return report_path
+
+    # ---------- Prediction --------------------------------------------------
 
     def _ensure_model_loaded(self):
         """Load the saved model from disk on first prediction.
 
         Raises:
-            FileNotFoundError: If no saved model exists at all. The GUI
-                catches this and prompts the user to train or to point at a
-                different ``outputs/models/`` folder.
+            FileNotFoundError: If no saved model exists.
         """
         if self._model is None:
             if not self.is_model_available():
@@ -445,15 +480,13 @@ class WorkflowService:
         return self._model
 
     def predict_image(self, file_path: str | Path) -> dict:
-        """Predict the class of one image and return prediction + confidence.
+        """Predict the class of one image.
 
         Args:
             file_path: Path to an image file on disk.
 
         Returns:
-            Dict with ``predicted_class`` (str) and ``confidence`` (float
-            in [0, 1]). Confidence falls back to 0.0 for models that do not
-            expose ``predict_proba``.
+            Dict with predicted_class (str) and confidence (float in [0, 1]).
         """
         model = self._ensure_model_loaded()
         features = self.preprocessor.transform(file_path).reshape(1, -1)
