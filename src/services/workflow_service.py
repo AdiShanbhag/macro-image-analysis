@@ -251,12 +251,22 @@ class WorkflowService:
 
     # ---------- EDA ---------------------------------------------------------
 
-    def generate_eda(self) -> list[Path]:
+    def generate_eda(self, selected_classes: list[str] | None = None) -> list[Path]:
         """Produce the standard EDA chart set into outputs/eda/.
 
-        Returns the list of saved file paths so the GUI can preview them.
+        Args:
+            selected_classes: If provided, only include these classes in the
+                              charts. If None, uses all available classes.
+
+        Returns the list of saved file paths so the GUI can display them.
         """
         dataframe = self.load_dataframe()
+
+        if selected_classes:
+            dataframe = dataframe[
+                dataframe["label"].isin(selected_classes)
+            ].reset_index(drop=True)
+
         self.eda_output_dir.mkdir(parents=True, exist_ok=True)
 
         produced: list[Path] = []
